@@ -1,238 +1,384 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""SAC agent with JAX/Flax, supporting weighted losses for priority replay."""
+
+from functools import partial
+from typing import Optional, Sequence, Tuple, Dict
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax import struct
+from flax.training.train_state import TrainState
+import optax
+
+import tensorflow_probability.substrates.jax as tfp
+tfd = tfp.distributions
+tfb = tfp.bijectors
+
+default_init = nn.initializers.xavier_uniform
+
+
+class MLP(nn.Module):
+    """MLP with optional layer norm."""
+    hidden_dims: Sequence[int] = (256, 256)
+    activate_final: bool = False
+    use_layer_norm: bool = True
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        for i, size in enumerate(self.hidden_dims):
+            x = nn.Dense(size, kernel_init=default_init())(x)
+            if i < len(self.hidden_dims) - 1 or self.activate_final:
+                if self.use_layer_norm:
+                    x = nn.LayerNorm()(x)
+                x = nn.relu(x)
+        return x
+
 
 class Critic(nn.Module):
-    def __init__(self, obs_dim, action_dim, activation = nn.ReLU, use_layer_norm = True, activate_final = False, hidden_dims = (256, 256)):
-        super().__init__()
-        input_dim = obs_dim + action_dim
-        layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(activation())
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dims[-1], 1))
-        if activate_final:
-            layers.append(activation())
-        
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        input = torch.cat([obs, action], dim = -1)
-        return self.network(input)
+    """Critic network: concat(obs, action) -> MLP -> scalar."""
+    hidden_dims: Sequence[int] = (256, 256)
+    use_layer_norm: bool = True
 
-class EnsembleCritic(nn.Module):
-    def __init__(self, num_qs = 2, num_min_qs = 2, **critic_kwargs):
-        super().__init__()
-        self.num_qs = num_qs
-        self.num_min_qs = num_min_qs
-        self.ensemble = nn.ModuleList([Critic(**critic_kwargs) for _ in range(num_qs)])
-        
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        q_values = torch.stack([critic(obs, action) for critic in self.ensemble], dim = 0)
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([observations, actions], axis=-1)
+        x = MLP(self.hidden_dims, activate_final=True,
+                use_layer_norm=self.use_layer_norm)(x)
+        return nn.Dense(1, kernel_init=default_init())(x).squeeze(-1)
 
-        return q_values
-        
-    def sample_min_qs(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        q_values = self.forward(obs, action)
-        indices = torch.randperm(self.num_qs, device = q_values.device)[:self.num_min_qs]
-        sampled_qs = q_values[indices]
-        min_q = sampled_qs.min(dim = 0)[0]
-        return min_q
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim, action_dim, activation = nn.ReLU, hidden_dims = (256, 256),
-                 log_std_min = -20, log_std_max = 2):
-        super().__init__()
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        
-        layers = []
-        prev_dim = obs_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(activation())
-            prev_dim = hidden_dim
-        self.trunk = nn.Sequential(*layers)
-        self.mean_layer = nn.Linear(hidden_dims[-1], action_dim)
-        self.log_std_layer = nn.Linear(hidden_dims[-1], action_dim)
-        
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-            Returns mean and log_std of the action distribution
-        """
-        h = self.trunk(obs)
-        mean = self.mean_layer(h)
-        log_std = self.log_std_layer(h)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        return mean, log_std
-    
-    def sample(self, obs: torch.Tensor, deterministic: bool = False):
-        """
+class CriticEnsemble(nn.Module):
+    """Vectorized ensemble via nn.vmap."""
+    critic_cls: type
+    num: int = 10
 
-        """
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        if deterministic:
-            action = torch.tanh(mean)
-            log_prob = torch.zeros((obs.shape[0], 1), device = obs.device)
-        else:
-            normal = torch.distributions.Normal(mean, std)
-            x = normal.rsample()
-            action = torch.tanh(x)
+    @nn.compact
+    def __call__(self, *args, **kwargs):
+        ensemble = nn.vmap(
+            self.critic_cls,
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.num,
+        )
+        return ensemble()(*args, **kwargs)
 
-            log_prob = normal.log_prob(x)
-            log_prob -= torch.log(torch.clamp(1 - action.pow(2), min = 1e-6))
-            log_prob = log_prob.sum(dim = -1, keepdim = True)
-        
-        return action, log_prob
 
-class SAC(nn.Module):
-    def __init__(self, obs_dim, action_dim, device = 'cuda', hidden_dims = (256, 256), num_qs = 2, num_min_qs = 2, actor_lr = 3e-4, critic_lr = 3e-4, alpha_lr = 3e-4, discount = 0.99, tau = 0.005, use_layer_norm = True):
-        super().__init__()
-        self.device = device
-        self.discount = discount
-        self.tau = tau
-        self.num_qs = num_qs
-        self.num_min_qs = num_min_qs
-        self.target_entropy = - 0.5 * action_dim
-    
-        self.actor = Actor(obs_dim, action_dim, hidden_dims = hidden_dims).to(device)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), actor_lr)
-        
-        critic_kwargs = {
-            'obs_dim': obs_dim,
-            'action_dim': action_dim,
-            'hidden_dims': hidden_dims,
-            'use_layer_norm': use_layer_norm
-        }
-        
-        self.critic = EnsembleCritic(num_qs = num_qs, num_min_qs=num_min_qs, **critic_kwargs).to(device)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), critic_lr)
+class TanhNormalActor(nn.Module):
+    """Actor network outputting tanh-squashed normal distribution."""
+    hidden_dims: Sequence[int] = (256, 256)
+    action_dim: int = 1
+    log_std_min: float = -20.0
+    log_std_max: float = 2.0
 
-        self.target_critic = EnsembleCritic(num_qs = num_qs, num_min_qs = num_min_qs, **critic_kwargs).to(device)
-        self.target_critic.load_state_dict(self.critic.state_dict())
-        
-        for param in self.target_critic.parameters():
-            param.requires_grad = False
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray) -> tfd.Distribution:
+        x = MLP(self.hidden_dims, activate_final=True, use_layer_norm=False)(observations)
+        mean = nn.Dense(self.action_dim, kernel_init=default_init())(x)
+        log_std = nn.Dense(self.action_dim, kernel_init=default_init())(x)
+        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
 
-        # Learnable temperature
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+        base_dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
+        return tfd.TransformedDistribution(base_dist, tfb.Tanh())
 
-    @property
-    def alpha(self):
-        return self.log_alpha.exp()
 
-    def update_critic(self, batch, weights=None):
-        """
-        Update both critic and target critic.
+class Temperature(nn.Module):
+    """Learnable temperature parameter."""
+    initial_temperature: float = 1.0
+
+    @nn.compact
+    def __call__(self) -> jnp.ndarray:
+        log_temp = self.param(
+            "log_temp",
+            lambda _: jnp.array(jnp.log(self.initial_temperature))
+        )
+        return jnp.exp(log_temp)
+
+
+def subsample_ensemble(key: jax.Array, params: dict,
+                       num_sample: Optional[int], num_qs: int) -> dict:
+    """Randomly select num_sample Q-networks from ensemble for target computation."""
+    if num_sample is None or num_sample == num_qs:
+        return params
+    indices = jax.random.choice(key, num_qs, shape=(num_sample,), replace=False)
+    return jax.tree_util.tree_map(lambda p: p[indices], params)
+
+
+class SACLearner(struct.PyTreeNode):
+    """SAC Agent supporting weighted losses for priority replay."""
+
+    rng: jax.Array
+    actor: TrainState
+    critic: TrainState
+    target_critic: TrainState
+    temp: TrainState
+
+    tau: float = struct.field(pytree_node=False, default=0.005)
+    discount: float = struct.field(pytree_node=False, default=0.99)
+    target_entropy: float = struct.field(pytree_node=False, default=-1.0)
+    num_qs: int = struct.field(pytree_node=False, default=10)
+    num_min_qs: int = struct.field(pytree_node=False, default=2)
+    backup_entropy: bool = struct.field(pytree_node=False, default=True)
+
+    @classmethod
+    def create(
+        cls,
+        seed: int,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int] = (256, 256),
+        num_qs: int = 10,
+        num_min_qs: int = 2,
+        actor_lr: float = 3e-4,
+        critic_lr: float = 3e-4,
+        temp_lr: float = 3e-4,
+        discount: float = 0.99,
+        tau: float = 0.005,
+        use_layer_norm: bool = True,
+        init_temperature: float = 1.0,
+        backup_entropy: bool = True,
+    ):
+        """Factory method to create SACLearner."""
+        rng = jax.random.PRNGKey(seed)
+        rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
+
+        dummy_obs = jnp.zeros((1, obs_dim))
+        dummy_action = jnp.zeros((1, action_dim))
+
+        # Actor
+        actor_def = TanhNormalActor(hidden_dims=tuple(hidden_dims), action_dim=action_dim)
+        actor_params = actor_def.init(actor_key, dummy_obs)["params"]
+        actor = TrainState.create(
+            apply_fn=actor_def.apply,
+            params=actor_params,
+            tx=optax.adam(actor_lr)
+        )
+
+        # Critic ensemble
+        critic_cls = partial(Critic, hidden_dims=tuple(hidden_dims),
+                             use_layer_norm=use_layer_norm)
+        critic_def = CriticEnsemble(critic_cls, num=num_qs)
+        critic_params = critic_def.init(critic_key, dummy_obs, dummy_action)["params"]
+        critic = TrainState.create(
+            apply_fn=critic_def.apply,
+            params=critic_params,
+            tx=optax.adam(critic_lr)
+        )
+
+        # Target critic (no optimizer needed) - use num_min_qs for subsampled ensemble
+        target_critic_def = CriticEnsemble(critic_cls, num=num_min_qs or num_qs)
+        target_critic = TrainState.create(
+            apply_fn=target_critic_def.apply,
+            params=critic_params,
+            tx=optax.GradientTransformation(lambda _: None, lambda _: None)
+        )
+
+        # Temperature
+        temp_def = Temperature(init_temperature)
+        temp_params = temp_def.init(temp_key)["params"]
+        temp = TrainState.create(
+            apply_fn=temp_def.apply,
+            params=temp_params,
+            tx=optax.adam(temp_lr)
+        )
+
+        return cls(
+            rng=rng,
+            actor=actor,
+            critic=critic,
+            target_critic=target_critic,
+            temp=temp,
+            tau=tau,
+            discount=discount,
+            target_entropy=-action_dim * 0.5,
+            num_qs=num_qs,
+            num_min_qs=num_min_qs,
+            backup_entropy=backup_entropy,
+        )
+
+    def update_critic(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        weights: Optional[jnp.ndarray] = None
+    ) -> Tuple["SACLearner", Dict[str, jnp.ndarray]]:
+        """Update critic with optional importance sampling weights."""
+        rng, key1, key2 = jax.random.split(self.rng, 3)
+
+        # Compute target Q
+        dist = self.actor.apply_fn({"params": self.actor.params}, batch["next_observations"])
+        next_actions = dist.sample(seed=key1)
+        next_log_probs = dist.log_prob(next_actions)
+
+        # Subsample ensemble for target
+        target_params = subsample_ensemble(key2, self.target_critic.params,
+                                           self.num_min_qs, self.num_qs)
+        next_qs = self.target_critic.apply_fn({"params": target_params},
+                                              batch["next_observations"], next_actions)
+        next_q = next_qs.min(axis=0)
+
+        temperature = self.temp.apply_fn({"params": self.temp.params})
+        target_q = batch["rewards"] + self.discount * batch["masks"] * next_q
+
+        if self.backup_entropy:
+            target_q = target_q - self.discount * batch["masks"] * temperature * next_log_probs
+
+        def critic_loss_fn(params):
+            qs = self.critic.apply_fn({"params": params},
+                                      batch["observations"], batch["actions"])
+            td_error = (qs - target_q) ** 2  # (num_qs, batch)
+
+            if weights is None:
+                loss = td_error.mean()
+            else:
+                # weights: (batch,), td_error: (num_qs, batch)
+                # Apply weights to each Q-network's loss, then average across Q-networks
+                loss = (weights[None, :] * td_error).mean()
+
+            return loss, {"critic_loss": loss, "q_mean": qs.mean(), "qs": qs}
+
+        grads, info = jax.grad(critic_loss_fn, has_aux=True)(self.critic.params)
+        critic = self.critic.apply_gradients(grads=grads)
+
+        # Soft update target
+        target_params = optax.incremental_update(
+            critic.params, self.target_critic.params, self.tau
+        )
+        target_critic = self.target_critic.replace(params=target_params)
+
+        return self.replace(critic=critic, target_critic=target_critic, rng=rng), info
+
+    def update_actor(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        weights: Optional[jnp.ndarray] = None
+    ) -> Tuple["SACLearner", Dict[str, jnp.ndarray]]:
+        """Update actor with optional importance sampling weights."""
+        rng, key = jax.random.split(self.rng)
+
+        def actor_loss_fn(params):
+            dist = self.actor.apply_fn({"params": params}, batch["observations"])
+            actions = dist.sample(seed=key)
+            log_probs = dist.log_prob(actions)
+
+            qs = self.critic.apply_fn({"params": self.critic.params},
+                                      batch["observations"], actions)
+            q_mean = qs.mean(axis=0)  # (batch,)
+
+            temperature = self.temp.apply_fn({"params": self.temp.params})
+            per_sample_loss = temperature * log_probs - q_mean
+
+            if weights is None:
+                loss = per_sample_loss.mean()
+                entropy = -log_probs.mean()
+            else:
+                loss = (weights * per_sample_loss).mean()
+                entropy = -(weights * log_probs).mean()
+
+            return loss, {"actor_loss": loss, "entropy": entropy, "qs_policy": qs}
+
+        grads, info = jax.grad(actor_loss_fn, has_aux=True)(self.actor.params)
+        actor = self.actor.apply_gradients(grads=grads)
+
+        return self.replace(actor=actor, rng=rng), info
+
+    def update_temperature(
+        self,
+        entropy: jnp.ndarray
+    ) -> Tuple["SACLearner", Dict[str, jnp.ndarray]]:
+        """Update temperature parameter."""
+        def temp_loss_fn(params):
+            temperature = self.temp.apply_fn({"params": params})
+            loss = temperature * (entropy - self.target_entropy)
+            return loss, {"temperature": temperature, "temp_loss": loss}
+
+        grads, info = jax.grad(temp_loss_fn, has_aux=True)(self.temp.params)
+        temp = self.temp.apply_gradients(grads=grads)
+
+        return self.replace(temp=temp), info
+
+    @partial(jax.jit, static_argnames=("utd_ratio",))
+    def update(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        utd_ratio: int,
+        weights: Optional[jnp.ndarray] = None,
+        offline_only_batch: Optional[Dict[str, jnp.ndarray]] = None
+    ) -> Tuple["SACLearner", Dict[str, jnp.ndarray]]:
+        """Full update with UTD ratio. Returns Q-values from last minibatch for priority computation.
 
         Args:
-            batch: Dictionary with obs, next_obs, actions, rewards, dones
-            weights: Optional tensor of shape (batch_size,) for weighted loss.
-                     If None, uses uniform weighting (standard MSE).
-                     Weights should sum to 1 for proper scaling.
+            batch: Main training batch
+            utd_ratio: Number of gradient updates per environment step
+            weights: Optional importance sampling weights for main batch
+            offline_only_batch: Optional offline-only batch for computing normalization statistics
+                               (no backpropagation on these samples)
         """
-        obs = batch['obs']
-        next_obs = batch['next_obs']
-        actions = batch['actions']
-        rewards = batch['rewards'].unsqueeze(-1)  # (batch_size,) -> (batch_size, 1)
-        dones = batch['dones'].unsqueeze(-1)  # (batch_size,) -> (batch_size, 1)
-        with torch.no_grad():
-            next_actions, next_log_probs = self.actor.sample(next_obs)
-            target_q = self.target_critic.sample_min_qs(next_obs, next_actions)
+        new_agent = self
+        batch_size = jax.tree_util.tree_leaves(batch)[0].shape[0] // utd_ratio
 
-            target_q = target_q - self.alpha * next_log_probs
+        for i in range(utd_ratio):
+            mini_batch = jax.tree_util.tree_map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, i * batch_size, batch_size),
+                batch
+            )
+            mini_weights = None
+            if weights is not None:
+                mini_weights = jax.lax.dynamic_slice_in_dim(weights, i * batch_size, batch_size)
 
-            target_q = rewards + (1 - dones) * self.discount * target_q
+            new_agent, critic_info = new_agent.update_critic(mini_batch, mini_weights)
 
-        q_values = self.critic(obs, actions)
+        # Actor and temperature update on last mini-batch only
+        new_agent, actor_info = new_agent.update_actor(mini_batch, mini_weights)
+        new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
 
-        # Compute weighted MSE loss
-        if weights is None:
-            # Standard MSE (uniform weighting)
-            critic_loss = F.mse_loss(q_values, target_q.unsqueeze(0).expand(self.num_qs, -1, -1))
-        else:
-            # Weighted MSE: weights should be (batch_size,), reshape to (1, batch_size, 1)
-            # Weights sum to 1.0, so weighted sum = weighted average (same scale as mean)
-            weights = weights.view(1, -1, 1)
-            td_errors = (q_values - target_q.unsqueeze(0).expand(self.num_qs, -1, -1)) ** 2
-            # Weighted average over batch, mean over ensemble and output dim
-            critic_loss = (td_errors * weights).sum(dim=1).mean()
+        info = {**critic_info, **actor_info, **temp_info}
 
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
+        # If offline_only_batch is provided, compute Q-values for normalization
+        if offline_only_batch is not None:
+            rng, key = jax.random.split(new_agent.rng)
 
+            # Compute Q-values for offline batch actions (no gradient)
+            offline_qs = new_agent.critic.apply_fn(
+                {"params": new_agent.critic.params},
+                offline_only_batch["observations"],
+                offline_only_batch["actions"]
+            )
 
-        with torch.no_grad():
-            for param, target_param in zip(self.critic.parameters(), self.target_critic.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+            # Compute Q-values for policy actions on offline batch (no gradient)
+            offline_dist = new_agent.actor.apply_fn(
+                {"params": new_agent.actor.params},
+                offline_only_batch["observations"]
+            )
+            offline_policy_actions = offline_dist.sample(seed=key)
+            offline_qs_policy = new_agent.critic.apply_fn(
+                {"params": new_agent.critic.params},
+                offline_only_batch["observations"],
+                offline_policy_actions
+            )
 
-        return {
-            'critic_loss': critic_loss.item(),
-            'q_mean': q_values.mean().item(),
-            'q_values': q_values
-        }
+            # Store Q-values in info for computing advantage with same beta
+            info["offline_qs"] = offline_qs
+            info["offline_qs_policy"] = offline_qs_policy
 
-    def update_actor(self, batch, weights=None):
-        """
-        Update actor network.
+            new_agent = new_agent.replace(rng=rng)
 
-        Args:
-            batch: Dictionary with obs
-            weights: Optional tensor of shape (batch_size,) for weighted loss.
-                     If None, uses uniform weighting.
-                     Weights should sum to 1 for proper scaling.
-        """
-        obs = batch['obs']
-        actions, log_probs = self.actor.sample(obs)
-        q_values = self.critic(obs, actions)
-        q_mean = q_values.mean(dim=0)
+        return new_agent, info
 
-        # Per-sample actor loss
-        per_sample_loss = self.alpha.detach() * log_probs - q_mean
+    @jax.jit
+    def sample_actions(
+        self,
+        observations: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, "SACLearner"]:
+        """Sample actions for environment interaction."""
+        rng, key = jax.random.split(self.rng)
+        dist = self.actor.apply_fn({"params": self.actor.params}, observations)
+        actions = dist.sample(seed=key)
+        return actions, self.replace(rng=rng)
 
-        if weights is None:
-            # Standard mean (uniform weighting)
-            actor_loss = per_sample_loss.mean()
-            entropy = -log_probs.mean().item()
-        else:
-            # Weighted loss
-            weights = weights.view(-1, 1)
-            actor_loss = (per_sample_loss * weights).sum()
-            entropy = -(log_probs * weights).sum().item()
-
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        return {
-            'actor_loss': actor_loss.item(),
-            'entropy': entropy,
-            'q_values_policy': q_values
-        }
-
-    def update_temperature(self, entropy):
-        """Update temperature parameter"""
-        # Loss: -log_alpha * (entropy - target_entropy).detach()
-        temp_loss = -self.log_alpha * (entropy - self.target_entropy)
-
-        self.alpha_optimizer.zero_grad()
-        temp_loss.backward()
-        self.alpha_optimizer.step()
-
-        return {
-            'alpha': self.alpha.item(),
-            'temp_loss': temp_loss.item()
-        }
-
-    def update(self, batch):
-        critic_info = self.update_critic(batch)
-        actor_info = self.update_actor(batch)
-        temp_info = self.update_temperature(actor_info['entropy'])
-        return {**critic_info, **actor_info, **temp_info}
+    @jax.jit
+    def eval_actions(self, observations: jnp.ndarray) -> jnp.ndarray:
+        """Deterministic actions for evaluation (mean of base distribution, tanh-squashed)."""
+        dist = self.actor.apply_fn({"params": self.actor.params}, observations)
+        # For TanhNormal: get mean of base distribution and apply tanh
+        return jnp.tanh(dist.distribution.mean())

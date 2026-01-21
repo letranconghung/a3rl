@@ -1,94 +1,141 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+"""Density network for offline/online ratio estimation in JAX/Flax."""
+
+from functools import partial
+from typing import Dict, Sequence, Tuple
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax import struct
+from flax.training.train_state import TrainState
+import optax
 
 
-class DensityNetwork(nn.Module):
-    """
-    Density ratio estimation network for offline-to-online RL.
+class DensityMLP(nn.Module):
+    """MLP with Softplus output for density ratio estimation."""
+    hidden_dims: Sequence[int] = (256, 256)
 
-    Estimates the density ratio between offline and online data distributions
-    using a two-sample density ratio estimation approach.
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([observations, actions], axis=-1)
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim)(x)
+            x = nn.relu(x)
+        x = nn.Dense(1)(x)
+        return nn.softplus(x)  # Positive output
 
-    Architecture: MLP with (256, 256) hidden dims, ReLU activation, no layer norm,
-    and Softplus output activation for positive outputs.
-    """
 
-    def __init__(self, obs_dim, action_dim, hidden_dims=(256, 256), lr=3e-4, device='cuda'):
-        super().__init__()
-        self.device = device
+class DensityNetwork(struct.PyTreeNode):
+    """Density ratio estimator using f-divergence."""
 
-        # Build MLP: (obs+action) -> hidden -> hidden -> 1 -> Softplus
-        input_dim = obs_dim + action_dim
-        layers = []
-        prev_dim = input_dim
+    state: TrainState
 
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            prev_dim = hidden_dim
+    @classmethod
+    def create(
+        cls,
+        seed: int,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int] = (256, 256),
+        lr: float = 3e-4
+    ):
+        rng = jax.random.PRNGKey(seed)
 
-        # Final layer outputs scalar
-        layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Softplus())
+        dummy_obs = jnp.zeros((1, obs_dim))
+        dummy_action = jnp.zeros((1, action_dim))
 
-        self.network = nn.Sequential(*layers)
-        self.to(device)
+        model = DensityMLP(hidden_dims=tuple(hidden_dims))
+        params = model.init(rng, dummy_obs, dummy_action)["params"]
 
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=params,
+            tx=optax.adam(lr)
+        )
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return cls(state=state)
+
+    def __call__(
+        self,
+        observations: jnp.ndarray,
+        actions: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Forward pass: returns density weights."""
+        return self.state.apply_fn({"params": self.state.params}, observations, actions)
+
+    @partial(jax.jit, static_argnames=("utd_ratio",))
+    def update(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        utd_ratio: int
+    ) -> Tuple["DensityNetwork", Dict[str, jnp.ndarray]]:
         """
-        Forward pass through density network.
+        Update using f-divergence density ratio estimation.
+
+        Matches SAC UTD ratio pattern: accepts interleaved offline/online batch,
+        splits into minibatches, and de-interleaves within each UTD step.
+
+        Loss: E_offline[-log(2/(w+1))] - E_online[log(2w/(w+1))]
 
         Args:
-            obs: Observations tensor of shape (batch_size, obs_dim)
-            action: Actions tensor of shape (batch_size, action_dim)
+            batch: Combined batch with interleaved offline/online samples.
+                   Shape: [batch_size * utd_ratio * 2, ...] where samples alternate
+                   offline, online, offline, online, ...
+            utd_ratio: Number of gradient updates to perform
 
         Returns:
-            Density weights of shape (batch_size, 1), positive values via Softplus
+            Updated density network and info dict
         """
-        x = torch.cat([obs, action], dim=-1)
-        return self.network(x)
+        new_density = self
+        # Total samples = batch_size * utd_ratio * 2 (half offline, half online, interleaved)
+        # Each minibatch = batch_size * 2, then de-interleave to get batch_size each
+        minibatch_size = jax.tree_util.tree_leaves(batch)[0].shape[0] // utd_ratio
 
-    def update(self, offline_batch: dict, online_batch: dict) -> dict:
-        """
-        Update density network using two-sample density ratio estimation.
+        for i in range(utd_ratio):
+            # Slice minibatch (contains interleaved offline/online)
+            mini_batch = jax.tree_util.tree_map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, i * minibatch_size, minibatch_size),
+                batch
+            )
 
-        Loss follows sac_learner_priority.py:348-379:
-            offline_f_star = -log(2.0 / (offline_weight + 1))
-            online_f_prime = log(2 * online_weight / (online_weight + 1))
-            loss = mean(offline_f_star - online_f_prime)
+            # De-interleave: even indices are offline, odd indices are online
+            offline_obs = mini_batch["observations"][0::2]
+            offline_actions = mini_batch["actions"][0::2]
+            online_obs = mini_batch["observations"][1::2]
+            online_actions = mini_batch["actions"][1::2]
 
-        Args:
-            offline_batch: Batch from offline replay buffer with 'obs', 'actions'
-            online_batch: Batch from online replay buffer with 'obs', 'actions'
+            new_density, info = new_density._update_step(
+                offline_obs, offline_actions, online_obs, online_actions
+            )
 
-        Returns:
-            Dictionary with metrics: density_loss, offline_weight, online_weight
-        """
-        # Compute density weights for both batches
-        offline_weight = self.forward(offline_batch['obs'], offline_batch['actions'])
-        online_weight = self.forward(online_batch['obs'], online_batch['actions'])
+        return new_density, info
 
-        # Compute f-divergence terms (from density ratio estimation)
-        # Add epsilon for numerical stability to avoid log(0)
-        eps = 1e-10
-        offline_f_star = -torch.log(2.0 / (offline_weight + 1) + eps)
-        online_f_prime = torch.log(2 * online_weight / (online_weight + 1) + eps)
+    def _update_step(
+        self,
+        offline_obs: jnp.ndarray,
+        offline_actions: jnp.ndarray,
+        online_obs: jnp.ndarray,
+        online_actions: jnp.ndarray,
+    ) -> Tuple["DensityNetwork", Dict[str, jnp.ndarray]]:
+        """Single density update step."""
+        def loss_fn(params):
+            offline_w = self.state.apply_fn({"params": params}, offline_obs, offline_actions)
+            online_w = self.state.apply_fn({"params": params}, online_obs, online_actions)
 
-        # Loss: minimize difference (trains to distinguish offline vs online)
-        loss = torch.mean(offline_f_star - online_f_prime)
+            eps = 1e-10
+            offline_term = -jnp.log(2.0 / (offline_w + 1) + eps)
+            online_term = jnp.log(2 * online_w / (online_w + 1) + eps)
 
-        # Update
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+            loss = offline_term.mean() - online_term.mean()
 
-        return {
-            'density_loss': loss.item(),
-            'offline_weight': offline_weight.mean().item(),
-            'online_weight': online_weight.mean().item(),
-            'offline_weight_tensor': offline_weight.detach(),  # For priority updates
-        }
+            return loss, {
+                "density_loss": loss,
+                "offline_weight": offline_w.mean(),
+                "online_weight": online_w.mean(),
+                "offline_weights": offline_w,  # For denom computation
+            }
+
+        grads, info = jax.grad(loss_fn, has_aux=True)(self.state.params)
+        new_state = self.state.apply_gradients(grads=grads)
+
+        return self.replace(state=new_state), info
