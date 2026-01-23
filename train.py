@@ -215,9 +215,19 @@ def train_rlpd(args, agent, offline_buffer, online_buffer, env, eval_env):
 
 def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority_buffer,
                offline_size, env, eval_env):
-    """A3RL training: priority replay with density-weighted UCB priorities."""
+    """A3RL training with RLPD warmup phase.
+
+    First 25% of steps: Follow RLPD (uniform 50/50 sampling) but maintain density learning
+                        and priority buffer with 0.5 priority for online samples.
+    Remaining 75% of steps: Switch to A3RL (priority-weighted sampling with density-based priorities).
+    """
     obs, _ = env.reset()
     denom = 1.0  # Will be updated by density network
+
+    warmup_steps = int(0.25 * args.max_env_steps)
+
+    print(f"A3RL with RLPD warmup: first {warmup_steps} steps use uniform 50/50 sampling")
+    print(f"Then switch to priority-weighted A3RL sampling for remaining {args.max_env_steps - warmup_steps} steps")
 
     for step in trange(args.max_env_steps, desc="Training (A3RL)"):
         # Environment interaction
@@ -229,8 +239,13 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
 
         # Add to BOTH online_buffer AND priority_buffer
         online_buffer.insert(obs, action, next_obs, reward, mask)
-        # Use max_priority for new online transitions
-        priority_buffer.insert_with_priority(obs, action, next_obs, reward, mask, priority_buffer.max_priority)
+        # During warmup: use 0.5 priority; after: use max_priority (updated by A3RL)
+        if step < warmup_steps:
+            priority_buffer.insert_with_priority(obs, action, next_obs, reward, mask, 0.5 * len(offline_buffer)/warmup_steps)
+        else:
+            priority_buffer.insert_with_priority(
+                obs, action, next_obs, reward, mask, priority_buffer.max_priority
+            )
 
         obs = next_obs
         if terminated or truncated:
@@ -257,20 +272,28 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
         denom = (density_info["offline_weights"] ** args.priority_alpha).mean()
 
         # ===== SAC UPDATE =====
-        # Sample from priority_buffer (priority-weighted)
-        total_sac_samples = args.batch_size * args.utd_ratio
-        sac_batch, sac_indices, sac_weights = priority_buffer.sample(
-            total_sac_samples, step=step, utd_ratio=args.utd_ratio
-        )
+        is_warmup_phase = step < warmup_steps
+
+        if is_warmup_phase:
+            # WARMUP: Sample uniformly 50/50 from offline and online buffers
+            half_batch = (args.batch_size * args.utd_ratio) // 2
+            sac_offline_batch = offline_buffer.sample(half_batch)
+            sac_online_batch = online_buffer.sample(half_batch)
+            sac_batch = combine_batches(sac_offline_batch, sac_online_batch)
+            sac_weights = None  # Uniform sampling
+            sac_indices = None  # Not needed for warmup
+            offline_sample_pct = 0.5  # Exactly 50/50 during warmup
+        else:
+            # A3RL: Sample from priority_buffer (priority-weighted)
+            total_sac_samples = args.batch_size * args.utd_ratio
+            sac_batch, sac_indices, sac_weights = priority_buffer.sample(
+                total_sac_samples, step=step, utd_ratio=args.utd_ratio
+            )
+            # Compute percentage of offline samples (indices < offline_size are offline)
+            offline_sample_pct = (sac_indices < offline_size).mean()
 
         # Sample offline-only batch for normalization statistics (no backprop)
         offline_only_batch = offline_buffer.sample(args.batch_size)
-
-        # Compute percentage of offline samples (indices < offline_size are offline)
-        offline_sample_pct = (sac_indices < offline_size).mean()
-
-        # Weights are normalized to sum to utd_ratio in the buffer sample method
-        # No additional scaling needed
 
         # SAC update with IS weights and offline-only batch for normalization
         agent, sac_info = agent.update(
@@ -279,35 +302,37 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
             offline_only_batch=offline_only_batch
         )
 
-        # ===== PRIORITY UPDATE (last minibatch only) =====
-        last_batch_size = args.batch_size
-        last_indices = sac_indices[-last_batch_size:]
+        # ===== PRIORITY UPDATE (A3RL phase only, after warmup) =====
+        if not is_warmup_phase:
+            last_batch_size = args.batch_size
+            last_indices = sac_indices[-last_batch_size:]
 
-        # Get observations/actions for last minibatch
-        last_obs = sac_batch["observations"][-last_batch_size:]
-        last_actions = sac_batch["actions"][-last_batch_size:]
+            # Get observations/actions for last minibatch
+            last_obs = sac_batch["observations"][-last_batch_size:]
+            last_actions = sac_batch["actions"][-last_batch_size:]
 
-        # Forward pass density on last minibatch
-        last_density = density_net(last_obs, last_actions)
+            # Forward pass density on last minibatch
+            last_density = density_net(last_obs, last_actions)
 
-        # Compute new priorities using advantage with Z-score normalization
-        new_priorities, priority_metrics = compute_a3rl_priorities(
-            sac_info["qs"],
-            sac_info["qs_policy"],
-            last_density,
-            denom,
-            args.advantage_lambda,
-            args.advantage_beta,
-            args.priority_alpha,
-            sac_info["offline_qs"],
-            sac_info["offline_qs_policy"],
-        )
+            # Compute new priorities using advantage with Z-score normalization
+            new_priorities, priority_metrics = compute_a3rl_priorities(
+                sac_info["qs"],
+                sac_info["qs_policy"],
+                last_density,
+                denom,
+                args.advantage_lambda,
+                args.advantage_beta,
+                args.priority_alpha,
+                sac_info["offline_qs"],
+                sac_info["offline_qs_policy"],
+            )
 
-        # Update priorities in priority_buffer
-        priority_buffer.update_priorities(last_indices, np.asarray(new_priorities))
+            # Update priorities in priority_buffer
+            priority_buffer.update_priorities(last_indices, np.asarray(new_priorities))
 
         # ===== LOGGING =====
         if step % args.log_interval == 0:
+            priority_entropy = priority_buffer.compute_entropy()
             log_dict = {
                 "train/critic_loss": float(sac_info["critic_loss"]),
                 "train/actor_loss": float(sac_info["actor_loss"]),
@@ -319,12 +344,15 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
                 "train/online_weight": float(density_info["online_weight"]),
                 "train/denom": float(denom),
                 "train/max_priority": priority_buffer.max_priority,
+                "train/priority_entropy": float(priority_entropy),
                 "train/offline_sample_pct": float(offline_sample_pct),
-                "train/is_weight_mean": float(sac_weights.mean()),
+                "train/is_warmup_phase": float(is_warmup_phase),
                 "train/env_steps": step,
             }
-            for k, v in priority_metrics.items():
-                log_dict[f"priority/{k}"] = float(v)
+            if not is_warmup_phase:
+                log_dict["train/is_weight_mean"] = float(sac_weights.mean())
+                for k, v in priority_metrics.items():
+                    log_dict[f"priority/{k}"] = float(v)
             wandb.log(log_dict, step=step)
 
         # Evaluation

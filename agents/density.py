@@ -122,11 +122,10 @@ class DensityNetwork(struct.PyTreeNode):
             offline_w = self.state.apply_fn({"params": params}, offline_obs, offline_actions)
             online_w = self.state.apply_fn({"params": params}, online_obs, online_actions)
 
-            eps = 1e-10
-            offline_term = -jnp.log(2.0 / (offline_w + 1) + eps)
-            online_term = jnp.log(2 * online_w / (online_w + 1) + eps)
+            offline_f_star_f_prime = -jnp.log(2.0 / (offline_w + 1) + 1e-10)
+            online_f_prime = jnp.log(2 * online_w / (online_w + 1) + 1e-10)
 
-            loss = offline_term.mean() - online_term.mean()
+            loss = offline_f_star_f_prime.mean() - online_f_prime.mean()
 
             return loss, {
                 "density_loss": loss,

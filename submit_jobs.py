@@ -42,11 +42,11 @@ def main():
     parser.add_argument("--algorithm", type=str, nargs="+", default=["a3rl"],
                        choices=["rlpd", "a3rl"],
                        help="Algorithm(s) to run (default: a3rl)")
-    parser.add_argument("--priority_alpha", type=float, nargs="+", default=[0.2],
+    parser.add_argument("--priority_alpha", type=float, nargs="+", default=[0.04],
                        help="Priority alpha values (default: 0.6, only used for a3rl)")
-    parser.add_argument("--advantage_lambda", type=float, nargs="+", default=[1.0],
+    parser.add_argument("--advantage_lambda", type=float, nargs="+", default=[0.3],
                        help="Advantage lambda values (default: 1.0, only used for a3rl)")
-    parser.add_argument("--advantage_beta", type=float, nargs="+", default=[1.0],
+    parser.add_argument("--advantage_beta", type=float, nargs="+", default=[-0.2],
                        help="Advantage beta (UCB coefficient) values (default: 1.0, only used for a3rl)")
 
     args = parser.parse_args()

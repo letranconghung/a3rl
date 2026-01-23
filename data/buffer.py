@@ -352,6 +352,18 @@ class PriorityReplayBuffer:
         # Set max_priority to actual max of all priorities in buffer
         self.max_priority = self.priorities[:self._size].max()
 
+    def compute_entropy(self) -> float:
+        """Compute the entropy of the priority distribution.
+
+        Returns:
+            Entropy in nats (natural log units)
+        """
+        priorities = self.priorities[:self._size]
+        probs = priorities / priorities.sum()
+        # Add small epsilon to avoid log(0)
+        entropy = -np.sum(probs * np.log(probs + 1e-10))
+        return float(entropy)
+
     def load_from_minari(self, dataset_id: str, download: bool = True, sample_percentage: float = 1.0):
         """Load offline dataset from Minari with optional random sampling.
 

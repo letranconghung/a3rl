@@ -78,18 +78,37 @@ python submit_jobs.py \
   --algorithm a3rl
 ```
 
+"mujoco/halfcheetah/simple-v0:0.98,mujoco/halfcheetah/expert-v0:0.02" "mujoco/ant/simple-v0:0.98,mujoco/ant/expert-v0:0.02" "mujoco/humanoid/simple-v0:0.98,mujoco/humanoid/expert-v0:0.02" "mujoco/humanoidstandup/simple-v0:0.98,mujoco/humanoidstandup/expert-v0:0.02" "mujoco/walker2d/simple-v0:0.98,mujoco/walker2d/expert-v0:0.02" "mujoco/hopper/simple-v0:0.98,mujoco/hopper/expert-v0:0.02"
+
+
+# CURRENT
+python submit_jobs.py \
+  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" \
+  --seeds 0 1 2 --algorithm rlpd \
+  --version rlpd_v08
 
 python submit_jobs.py \
-  --dataset_ids "mujoco/hopper/medium-v0" "mujoco/halfcheetah/medium-v0" "mujoco/walker2d/medium-v0" "mujoco/ant/medium-v0" "mujoco/pusher/medium-v0" "mujoco/invertedpendulum/medium-v0" "mujoco/inverteddoublependulum/medium-v0" "mujoco/swimmer/medium-v0" "mujoco/humanoidstandup/medium-v0" "mujoco/reacher/medium-v0" "mujoco/humanoid/medium-v0" \
-  --seeds 0 1 2  --algorithm rlpd \
+  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" \
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.04 \
+  --advantage_lambda 0.3 \
+  --advantage_beta -0.2 \
+  --version a3rl_v11 --dry_run
+
+
+
+## Deprecated
+python submit_jobs.py \
+  --dataset_ids "mujoco/hopper/medium-v0" "mujoco/halfcheetah/medium-v0" "mujoco/walker2d/medium-v0" "mujoco/ant/medium-v0" "mujoco/swimmer/medium-v0" "mujoco/humanoidstandup/medium-v0" "mujoco/humanoid/medium-v0" \
+  --seeds 3 4  --algorithm rlpd \
   --version rlpd_v08 \
 
 python submit_jobs.py \
-  --dataset_ids "mujoco/hopper/medium-v0" "mujoco/halfcheetah/medium-v0" "mujoco/walker2d/medium-v0" "mujoco/ant/medium-v0" "mujoco/pusher/medium-v0" "mujoco/invertedpendulum/medium-v0" "mujoco/inverteddoublependulum/medium-v0" "mujoco/swimmer/medium-v0" "mujoco/humanoidstandup/medium-v0" "mujoco/reacher/medium-v0" "mujoco/humanoid/medium-v0" \
+  --dataset_ids "mujoco/hopper/medium-v0" "mujoco/halfcheetah/medium-v0" "mujoco/walker2d/medium-v0" "mujoco/ant/medium-v0" "mujoco/swimmer/medium-v0" "mujoco/humanoidstandup/medium-v0" "mujoco/humanoid/medium-v0" \
   --seeds 0 1 2 \
-  --advantage_lambda 0.1 0.3 1 3 \
-   --algorithm a3rl \
-  --version a3rl_v08 \
+  --advantage_lambda 0.1 0.3 1 \
+  --algorithm a3rl \
+  --version a3rl_v09 \
 
 ## How It Works
 
