@@ -1,10 +1,22 @@
 # A3RL
 
 # Algorithm versioning:
-RLPD stable version: v08
-A3RL stable version: v10. Behavior should be closely (if not the same as v08).
+RLPD stable version: v08->v13.
+A3RL stable version: v14
 
 # Changelogs
+## Version 14
+- warmup steps was at 0.005 for version 13. changed to 0.25.
+- 
+## Version 13
+- fixed bug from v12, where ther was a shape mismatch for offline priority, etc.
+## Version 12
+- Drastic ish change
+- Equal weights for offline and online data points, but now it matters which data points
+- Offline has priority buffer proportional to w * exp(lambda * A). w is calculated as density ** alpha, normalized to sum to 1.
+- Online has priority buffer proportional to exp(lambda * A).
+- No importance sampling
+- Density network still gets warmup.
 ## Version 11
 - Pretraining for 25%, and then A3RL
 - Reduced alpha to really small. (0.04). We'll see what hpapens.

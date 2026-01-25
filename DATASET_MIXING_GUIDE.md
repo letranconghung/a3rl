@@ -83,17 +83,94 @@ python submit_jobs.py \
 
 # CURRENT
 python submit_jobs.py \
-  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" \
+  --dataset_ids "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "D4RL/antmaze/umaze-v1" "D4RL/pointmaze/umaze-v2"\
   --seeds 0 1 2 --algorithm rlpd \
-  --version rlpd_v08
+  --version rlpd_v13
+
+**The classic ones**
+python submit_jobs.py \
+  --dataset_ids "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" \
+  "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "D4RL/antmaze/umaze-v1" "D4RL/pointmaze/umaze-v2"\
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.2 \
+  --advantage_lambda 0.3 1 1.5 \
+  --advantage_beta -0.2 \
+  --version a3rl_v13
+
+(sent)
+
+**The unbalanced ones**
+python submit_jobs.py \
+  --dataset_ids "mujoco/halfcheetah/simple-v0:0.95,mujoco/halfcheetah/expert-v0:0.05" "mujoco/ant/simple-v0:0.95,mujoco/ant/expert-v0:0.05" "mujoco/humanoid/simple-v0:0.95,mujoco/humanoid/expert-v0:0.05" "mujoco/humanoidstandup/simple-v0:0.95,mujoco/humanoidstandup/expert-v0:0.05" "mujoco/walker2d/simple-v0:0.95,mujoco/walker2d/expert-v0:0.05" "mujoco/hopper/simple-v0:0.95,mujoco/hopper/expert-v0:0.05" \
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.2 \
+  --advantage_lambda 0.3 1 1.5 \
+  --advantage_beta -0.2 \
+  --version a3rl_v13
 
 python submit_jobs.py \
-  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "mujoco/halfcheetah/simple-v0:0.5,mujoco/halfcheetah/expert-v0:0.5" "mujoco/ant/simple-v0:0.5,mujoco/ant/expert-v0:0.5" "mujoco/humanoid/simple-v0:0.5,mujoco/humanoid/expert-v0:0.5" "mujoco/humanoidstandup/simple-v0:0.5,mujoco/humanoidstandup/expert-v0:0.5" "mujoco/walker2d/simple-v0:0.5,mujoco/walker2d/expert-v0:0.5" "mujoco/hopper/simple-v0:0.5,mujoco/hopper/expert-v0:0.5" \
+  --dataset_ids "mujoco/halfcheetah/simple-v0:0.95,mujoco/halfcheetah/expert-v0:0.05" "mujoco/ant/simple-v0:0.95,mujoco/ant/expert-v0:0.05" "mujoco/humanoid/simple-v0:0.95,mujoco/humanoid/expert-v0:0.05" "mujoco/humanoidstandup/simple-v0:0.95,mujoco/humanoidstandup/expert-v0:0.05" "mujoco/walker2d/simple-v0:0.95,mujoco/walker2d/expert-v0:0.05" "mujoco/hopper/simple-v0:0.95,mujoco/hopper/expert-v0:0.05" \
+  --seeds 0 1 2 --algorithm rlpd \
+  --version rlpd_v13
+(sent)
+
+**The D4RL antmaze except for umaze ones**
+python submit_jobs.py \
+  --dataset_ids "D4RL/antmaze/medium-diverse-v1" "D4RL/antmaze/large-play-v1" "D4RL/antmaze/large-diverse-v1" "D4RL/antmaze/umaze-diverse-v1" "D4RL/antmaze/medium-play-v1" \
   --seeds 0 1 2 --algorithm a3rl \
-  --priority_alpha 0.04 \
-  --advantage_lambda 0.3 \
+  --priority_alpha 0.2 \
+  --advantage_lambda 0.3 1 1.5 \
   --advantage_beta -0.2 \
-  --version a3rl_v11 --dry_run
+  --version a3rl_v13
+
+python submit_jobs.py \
+  --dataset_ids "D4RL/antmaze/medium-diverse-v1" "D4RL/antmaze/large-play-v1" "D4RL/antmaze/large-diverse-v1" "D4RL/antmaze/umaze-diverse-v1" "D4RL/antmaze/medium-play-v1" \
+  --seeds 0 1 2 --algorithm rlpd \
+  --version rlpd_v13
+(sent)
+
+**Version 14: simple with only lambda 1. Density now normalized to sum.**
+python submit_jobs.py \
+  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "D4RL/antmaze/umaze-v1"\
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.2 \
+  --advantage_lambda 1 \
+  --advantage_beta -0.2 \
+  --version a3rl_v14
+
+**the new environments**
+python submit_jobs.py \
+  --dataset_ids "D4RL/pen/expert-v2" "D4RL/door/expert-v2" "D4RL/hammer/expert-v2" "D4RL/relocate/expert-v2" \
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.2 \
+  --advantage_lambda 1 \
+  --advantage_beta -0.2 \
+  --version a3rl_v14
+
+python submit_jobs.py \
+    --dataset_ids "D4RL/pen/expert-v2" "D4RL/door/expert-v2" "D4RL/hammer/expert-v2" "D4RL/relocate/expert-v2" \
+    --seeds 0 1 2 --algorithm rlpd \
+    --version rlpd_v13
+
+**extra hyperparameter search on the promising medium and expert**
+python submit_jobs.py \
+  --dataset_ids "mujoco/hopper/simple-v0" "mujoco/halfcheetah/simple-v0" "mujoco/walker2d/simple-v0" "mujoco/ant/simple-v0" "mujoco/humanoidstandup/simple-v0" "mujoco/humanoid/simple-v0" "D4RL/antmaze/umaze-v1"\
+  --seeds 0 1 2 --algorithm a3rl \
+  --priority_alpha 0.2 \
+  --advantage_lambda 1 \
+  --advantage_beta -0.2 \
+  --version a3rl_v14
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -47,88 +47,108 @@ def combine_batches(offline_batch, online_batch):
     return combined
 
 
-def compute_a3rl_priorities(
-    qs: jnp.ndarray,
-    qs_policy: jnp.ndarray,
-    density_weights: jnp.ndarray,
-    denom: float,
+def compute_a3rl_priorities_separate(
+    offline_qs: jnp.ndarray,
+    offline_qs_policy: jnp.ndarray,
+    online_qs: jnp.ndarray,
+    online_qs_policy: jnp.ndarray,
+    offline_density: jnp.ndarray,
+    online_density: jnp.ndarray,
     advantage_lambda: float,
     advantage_beta: float,
     priority_alpha: float,
-    offline_qs: jnp.ndarray,
-    offline_qs_policy: jnp.ndarray,
 ):
     """
-    Compute A3RL priorities using advantage with Z-score normalization.
+    Compute A3RL priorities with separate formulas for offline and online.
 
-    New priority = (density(s,a)**priority_alpha / denom) * exp(lambda * advantage_zscore)
+    Offline priority: (density(s,a)**priority_alpha / denom) * exp(lambda * advantage)
+    Online priority: exp(lambda * advantage)
+
+    Where denom = mean(density ** priority_alpha) over offline samples in the batch.
 
     Args:
-        qs: Q-values from critic on batch actions (num_qs, batch)
-        qs_policy: Q-values from critic on policy actions (num_qs, batch)
-        density_weights: Density(s,a) for each sample in last minibatch
-        denom: Mean of (density ** priority_alpha) on offline samples from density batch
+        offline_qs: Q-values from critic on offline batch actions (num_qs, batch_size)
+        offline_qs_policy: Q-values from critic on offline batch policy actions (num_qs, batch_size)
+        online_qs: Q-values from critic on online batch actions (num_qs, batch_size)
+        online_qs_policy: Q-values from critic on online batch policy actions (num_qs, batch_size)
+        offline_density: Density weights for offline samples (batch_size,)
+        online_density: Density weights for online samples (batch_size,)
         advantage_lambda: Temperature for exp scaling
         advantage_beta: Coefficient for advantage calculation (mean + beta * std)
         priority_alpha: Exponent for density weighting
-        offline_qs: Q-values for offline-only batch actions (num_qs, offline_batch)
-        offline_qs_policy: Q-values for offline-only batch policy actions (num_qs, offline_batch)
 
     Returns:
-        priorities, metrics_dict
+        offline_priorities, online_priorities, metrics_dict
     """
-    # Compute advantage for main batch
-    advantages = qs - qs_policy  # (num_qs, batch)
-    adv_mean = advantages.mean(axis=0)
-    adv_std = advantages.std(axis=0)
-    advantage = adv_mean + advantage_beta * adv_std
-
-    # Compute advantage for offline batch (same beta)
-    offline_advantages = offline_qs - offline_qs_policy  # (num_qs, offline_batch)
+    # Compute advantage for offline batch
+    offline_advantages = offline_qs - offline_qs_policy  # (num_qs, batch_size)
     offline_adv_mean = offline_advantages.mean(axis=0)
     offline_adv_std = offline_advantages.std(axis=0)
     offline_advantage = offline_adv_mean + advantage_beta * offline_adv_std
 
-    # Normalize as Z-score using offline batch statistics
+    # Compute advantage for online batch
+    online_advantages = online_qs - online_qs_policy  # (num_qs, batch_size)
+    online_adv_mean = online_advantages.mean(axis=0)
+    online_adv_std = online_advantages.std(axis=0)
+    online_advantage = online_adv_mean + advantage_beta * online_adv_std
+
+    # Normalize advantages as Z-score using offline batch statistics
     offline_advantage_mean = offline_advantage.mean()
     offline_advantage_std = offline_advantage.std()
-    advantage_zscore = (advantage - offline_advantage_mean) / jnp.maximum(offline_advantage_std, 1e-8)
-    # Clip Z-score to (-3, 3)
-    advantage_zscore = jnp.clip(advantage_zscore, -3.0, 3.0)
+    offline_advantage_zscore = (offline_advantage - offline_advantage_mean) / jnp.maximum(offline_advantage_std, 1e-8)
+    online_advantage_zscore = (online_advantage - offline_advantage_mean) / jnp.maximum(offline_advantage_std, 1e-8)
+    # Clip Z-scores to (-3, 3)
+    offline_advantage_zscore = jnp.clip(offline_advantage_zscore, -3.0, 3.0)
+    online_advantage_zscore = jnp.clip(online_advantage_zscore, -3.0, 3.0)
 
-    # Priority = (density^alpha / denom) * exp(lambda * advantage_zscore)
-    advantage_zscore_scaled = advantage_lambda * advantage_zscore
+    # Compute denom from offline samples
+    density_raised = offline_density ** priority_alpha
+    denom = density_raised.sum()
 
-    density_term = (density_weights ** priority_alpha) / jnp.maximum(denom, 1e-8)
-    advantage_term = jnp.exp(advantage_zscore_scaled)
+    # Offline priority: (density^alpha / denom) * exp(lambda * advantage_zscore)
+    offline_advantage_scaled = advantage_lambda * offline_advantage_zscore
+    offline_density_term = density_raised / jnp.maximum(denom, 1e-8)
+    offline_advantage_term = jnp.exp(offline_advantage_scaled)
+    offline_priorities = offline_density_term.squeeze() * offline_advantage_term
 
-    priorities = density_term.squeeze() * advantage_term
+    # Online priority: exp(lambda * advantage_zscore)
+    online_advantage_scaled = advantage_lambda * online_advantage_zscore
+    online_advantage_term = jnp.exp(online_advantage_scaled)
+    online_priorities = online_advantage_term.squeeze()
+
     # Ensure no NaN or inf values
-    priorities = jnp.nan_to_num(priorities, nan=1.0, posinf=1e5, neginf=1e-5)
-    priorities = jnp.clip(priorities, 1e-5, 1e5)
+    offline_priorities = jnp.nan_to_num(offline_priorities, nan=1.0, posinf=1e5, neginf=1e-5)
+    offline_priorities = jnp.clip(offline_priorities, 1e-5, 1e5)
+    online_priorities = jnp.nan_to_num(online_priorities, nan=1.0, posinf=1e5, neginf=1e-5)
+    online_priorities = jnp.clip(online_priorities, 1e-5, 1e5)
 
     metrics = {
-        "advantage_mean": advantage.mean(),
-        "advantage_std": advantage.std(),
-        "advantage_min": advantage.min(),
-        "advantage_max": advantage.max(),
-        "offline_advantage_mean": offline_advantage_mean,
-        "offline_advantage_std": offline_advantage_std,
-        "advantage_zscore_mean": advantage_zscore.mean(),
-        "advantage_zscore_std": advantage_zscore.std(),
-        "advantage_zscore_min": advantage_zscore.min(),
-        "advantage_zscore_max": advantage_zscore.max(),
-        "density_term_mean": density_term.mean(),
-        "density_term_std": density_term.std(),
-        "advantage_term_mean": advantage_term.mean(),
-        "advantage_term_std": advantage_term.std(),
-        "priority_mean": priorities.mean(),
-        "priority_std": priorities.std(),
-        "priority_min": priorities.min(),
-        "priority_max": priorities.max(),
+        "offline_advantage_mean": offline_advantage.mean(),
+        "offline_advantage_std": offline_advantage.std(),
+        "offline_advantage_min": offline_advantage.min(),
+        "offline_advantage_max": offline_advantage.max(),
+        "online_advantage_mean": online_advantage.mean(),
+        "online_advantage_std": online_advantage.std(),
+        "online_advantage_min": online_advantage.min(),
+        "online_advantage_max": online_advantage.max(),
+        "offline_advantage_zscore_mean": offline_advantage_zscore.mean(),
+        "offline_advantage_zscore_std": offline_advantage_zscore.std(),
+        "online_advantage_zscore_mean": online_advantage_zscore.mean(),
+        "online_advantage_zscore_std": online_advantage_zscore.std(),
+        "offline_advantage_term_mean": offline_advantage_term.mean(),
+        "offline_advantage_term_std": offline_advantage_term.std(),
+        "online_advantage_term_mean": online_advantage_term.mean(),
+        "online_advantage_term_std": online_advantage_term.std(),
+        "denom": denom,
+        "offline_density_term_mean": offline_density_term.mean(),
+        "offline_density_term_std": offline_density_term.std(),
+        "offline_priority_mean": offline_priorities.mean(),
+        "offline_priority_std": offline_priorities.std(),
+        "online_priority_mean": online_priorities.mean(),
+        "online_priority_std": online_priorities.std(),
     }
 
-    return priorities, metrics
+    return offline_priorities, online_priorities, metrics
 
 
 def evaluate(agent, env, num_episodes=10):
@@ -213,21 +233,22 @@ def train_rlpd(args, agent, offline_buffer, online_buffer, env, eval_env):
     return agent
 
 
-def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority_buffer,
-               offline_size, env, eval_env):
-    """A3RL training with RLPD warmup phase.
+def train_a3rl(args, agent, density_net, offline_buffer, online_buffer,
+               priority_offline_buffer, priority_online_buffer, env, eval_env):
+    """A3RL training with priority replay for offline and online buffers separately.
 
-    First 25% of steps: Follow RLPD (uniform 50/50 sampling) but maintain density learning
-                        and priority buffer with 0.5 priority for online samples.
-    Remaining 75% of steps: Switch to A3RL (priority-weighted sampling with density-based priorities).
+    Density network: samples uniformly 50/50 from offline and online buffers.
+    SAC network: samples 50/50 from priority_offline and priority_online buffers (each with priority weighting).
+    SAC updates: without importance sampling weights (uniform loss weighting).
     """
     obs, _ = env.reset()
     denom = 1.0  # Will be updated by density network
 
     warmup_steps = int(0.25 * args.max_env_steps)
 
-    print(f"A3RL with RLPD warmup: first {warmup_steps} steps use uniform 50/50 sampling")
-    print(f"Then switch to priority-weighted A3RL sampling for remaining {args.max_env_steps - warmup_steps} steps")
+    print(f"A3RL with separate priority offline/online buffers")
+    print(f"First {warmup_steps} steps: warmup phase with uniform sampling")
+    print(f"Remaining {args.max_env_steps - warmup_steps} steps: priority-weighted sampling from separate buffers")
 
     for step in trange(args.max_env_steps, desc="Training (A3RL)"):
         # Environment interaction
@@ -237,14 +258,16 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
         next_obs, reward, terminated, truncated, info = env.step(action)
         mask = 0.0 if (terminated or truncated) else 1.0
 
-        # Add to BOTH online_buffer AND priority_buffer
+        # Add to online_buffer AND priority_online_buffer
         online_buffer.insert(obs, action, next_obs, reward, mask)
         # During warmup: use 0.5 priority; after: use max_priority (updated by A3RL)
         if step < warmup_steps:
-            priority_buffer.insert_with_priority(obs, action, next_obs, reward, mask, 0.5 * len(offline_buffer)/warmup_steps)
+            priority_online_buffer.insert_with_priority(
+                obs, action, next_obs, reward, mask, 1
+            )
         else:
-            priority_buffer.insert_with_priority(
-                obs, action, next_obs, reward, mask, priority_buffer.max_priority
+            priority_online_buffer.insert_with_priority(
+                obs, action, next_obs, reward, mask, priority_online_buffer.max_priority
             )
 
         obs = next_obs
@@ -256,20 +279,16 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
                     "train/episode_length": info["episode"]["l"],
                 }, step=step)
 
-        # ===== DENSITY UPDATE (RLPD-style: UTD_ratio steps) =====
-        # Sample 50/50 from offline and online buffers (uniform)
-        # Total samples = batch_size * utd_ratio, split evenly between offline/online
+        # ===== DENSITY UPDATE (Uniform 50/50 sampling from offline/online) =====
+        # Sample uniformly from offline and online buffers
         half_total = (args.batch_size * args.utd_ratio) // 2
         density_offline_batch = offline_buffer.sample(half_total)
         density_online_batch = online_buffer.sample(half_total)
 
-        # Combine batches (interleave) - same pattern as SAC
+        # Combine batches (interleave)
         density_batch = combine_batches(density_offline_batch, density_online_batch)
 
         density_net, density_info = density_net.update(density_batch, args.utd_ratio)
-
-        # Compute denom = mean(density(s,a) ** priority_alpha) on last minibatch offline samples
-        denom = (density_info["offline_weights"] ** args.priority_alpha).mean()
 
         # ===== SAC UPDATE =====
         is_warmup_phase = step < warmup_steps
@@ -280,59 +299,70 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
             sac_offline_batch = offline_buffer.sample(half_batch)
             sac_online_batch = online_buffer.sample(half_batch)
             sac_batch = combine_batches(sac_offline_batch, sac_online_batch)
-            sac_weights = None  # Uniform sampling
-            sac_indices = None  # Not needed for warmup
-            offline_sample_pct = 0.5  # Exactly 50/50 during warmup
         else:
-            # A3RL: Sample from priority_buffer (priority-weighted)
-            total_sac_samples = args.batch_size * args.utd_ratio
-            sac_batch, sac_indices, sac_weights = priority_buffer.sample(
-                total_sac_samples, step=step, utd_ratio=args.utd_ratio
+            # A3RL: Sample 50/50 from priority_offline and priority_online (each with priority weighting)
+            half_batch = (args.batch_size * args.utd_ratio) // 2
+            sac_offline_batch, offline_indices, offline_weights = priority_offline_buffer.sample(
+                half_batch, step=step, utd_ratio=None  # Don't normalize to utd_ratio
             )
-            # Compute percentage of offline samples (indices < offline_size are offline)
-            offline_sample_pct = (sac_indices < offline_size).mean()
+            sac_online_batch, online_indices, online_weights = priority_online_buffer.sample(
+                half_batch, step=step, utd_ratio=None
+            )
+            # Combine batches (interleave)
+            sac_batch = combine_batches(sac_offline_batch, sac_online_batch)
 
-        # Sample offline-only batch for normalization statistics (no backprop)
-        offline_only_batch = offline_buffer.sample(args.batch_size)
-
-        # SAC update with IS weights and offline-only batch for normalization
+        # SAC update WITHOUT importance sampling weights (always None for uniform loss weighting)
         agent, sac_info = agent.update(
             sac_batch, args.utd_ratio,
-            weights=sac_weights,
-            offline_only_batch=offline_only_batch
+            weights=None,  # No importance sampling - uniform loss weighting
+            offline_only_batch=None
         )
 
         # ===== PRIORITY UPDATE (A3RL phase only, after warmup) =====
         if not is_warmup_phase:
             last_batch_size = args.batch_size
-            last_indices = sac_indices[-last_batch_size:]
 
-            # Get observations/actions for last minibatch
+            # Extract last minibatch indices from both offline and online
+            last_offline_indices = offline_indices[-last_batch_size//2:]
+            last_online_indices = online_indices[-last_batch_size//2:]
+
+            # Get observations/actions for last minibatch (interleaved offline/online)
             last_obs = sac_batch["observations"][-last_batch_size:]
             last_actions = sac_batch["actions"][-last_batch_size:]
 
-            # Forward pass density on last minibatch
+            # Forward pass density on last minibatch (returns separate for offline/online due to interleaving)
             last_density = density_net(last_obs, last_actions)
+            # Split density values (interleaved as offline, online, offline, online, ...)
+            offline_density = last_density[0::2]
+            online_density = last_density[1::2]
 
-            # Compute new priorities using advantage with Z-score normalization
-            new_priorities, priority_metrics = compute_a3rl_priorities(
-                sac_info["qs"],
-                sac_info["qs_policy"],
-                last_density,
-                denom,
+            # Split Q-values and Q-policy from last minibatch (interleaved as offline, online, offline, online, ...)
+            offline_qs = sac_info["qs"][:, -last_batch_size::2]
+            online_qs = sac_info["qs"][:, -last_batch_size+1::2]
+            offline_qs_policy = sac_info["qs_policy"][:, -last_batch_size::2]
+            online_qs_policy = sac_info["qs_policy"][:, -last_batch_size+1::2]
+
+            # Compute new priorities using separate formulas for offline and online
+            offline_priorities, online_priorities, priority_metrics = compute_a3rl_priorities_separate(
+                offline_qs,
+                offline_qs_policy,
+                online_qs,
+                online_qs_policy,
+                offline_density,
+                online_density,
                 args.advantage_lambda,
                 args.advantage_beta,
                 args.priority_alpha,
-                sac_info["offline_qs"],
-                sac_info["offline_qs_policy"],
             )
 
-            # Update priorities in priority_buffer
-            priority_buffer.update_priorities(last_indices, np.asarray(new_priorities))
+            # Update priorities in separate buffers
+            priority_offline_buffer.update_priorities(last_offline_indices, np.asarray(offline_priorities))
+            priority_online_buffer.update_priorities(last_online_indices, np.asarray(online_priorities))
 
         # ===== LOGGING =====
         if step % args.log_interval == 0:
-            priority_entropy = priority_buffer.compute_entropy()
+            offline_entropy = priority_offline_buffer.compute_entropy()
+            online_entropy = priority_online_buffer.compute_entropy()
             log_dict = {
                 "train/critic_loss": float(sac_info["critic_loss"]),
                 "train/actor_loss": float(sac_info["actor_loss"]),
@@ -342,15 +372,14 @@ def train_a3rl(args, agent, density_net, offline_buffer, online_buffer, priority
                 "train/density_loss": float(density_info["density_loss"]),
                 "train/offline_weight": float(density_info["offline_weight"]),
                 "train/online_weight": float(density_info["online_weight"]),
-                "train/denom": float(denom),
-                "train/max_priority": priority_buffer.max_priority,
-                "train/priority_entropy": float(priority_entropy),
-                "train/offline_sample_pct": float(offline_sample_pct),
+                "train/offline_max_priority": priority_offline_buffer.max_priority,
+                "train/online_max_priority": priority_online_buffer.max_priority,
+                "train/offline_priority_entropy": float(offline_entropy),
+                "train/online_priority_entropy": float(online_entropy),
                 "train/is_warmup_phase": float(is_warmup_phase),
                 "train/env_steps": step,
             }
             if not is_warmup_phase:
-                log_dict["train/is_weight_mean"] = float(sac_weights.mean())
                 for k, v in priority_metrics.items():
                     log_dict[f"priority/{k}"] = float(v)
             wandb.log(log_dict, step=step)
@@ -426,8 +455,8 @@ def main():
     if len(dataset_specs) == 1 and dataset_specs[0][1] == 1.0:
         dataset_name = dataset_specs[0][0]
     else:
-        dataset_name = "mixed_" + "_".join([
-            f"{ds.split('/')[-1]}p{int(pct*100)}" for ds, pct in dataset_specs
+        dataset_name = "_".join([
+            f"{ds}p{int(pct*100)}" for ds, pct in dataset_specs
         ])
 
     # Parameter string for naming
@@ -438,7 +467,7 @@ def main():
 
     if args.run_id is None:
         timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-        args.run_id = f"{dataset_name.replace('/', '_')}_seed{args.seed}_{param_str}_{timestamp}"
+        args.run_id = f"{args.wandb_version}_{dataset_name.replace('/', '_')}_seed{args.seed}_{param_str}_{timestamp}"
 
     if args.wandb_group is None:
         args.wandb_group = f"{args.wandb_version}_{dataset_name.replace('/', '_')}_{param_str}"
@@ -490,10 +519,9 @@ def main():
         online_buffer = UniformReplayBuffer(obs_dim, action_dim, capacity=2_000_000)
 
         density_net = None
-        priority_buffer = None
 
     else:  # a3rl
-        # A3RL: Two uniform buffers + one priority buffer
+        # A3RL: Two uniform buffers + two separate priority buffers (offline and online)
         offline_buffer = UniformReplayBuffer(obs_dim, action_dim, capacity=2_000_000)
         if len(dataset_specs) == 1 and dataset_specs[0][1] == 1.0:
             # Single dataset, load directly
@@ -505,20 +533,23 @@ def main():
 
         online_buffer = UniformReplayBuffer(obs_dim, action_dim, capacity=2_000_000)
 
-        priority_buffer = PriorityReplayBuffer(
+        # Create separate priority buffers for offline and online data
+        priority_offline_buffer = PriorityReplayBuffer(
             obs_dim, action_dim,
-            capacity=4_000_000,  # Holds both offline + online
+            capacity=2_000_000,
+            beta_start=args.priority_beta_start,
+            beta_frames=args.priority_beta_frames,
+        )
+        priority_online_buffer = PriorityReplayBuffer(
+            obs_dim, action_dim,
+            capacity=2_000_000,
             beta_start=args.priority_beta_start,
             beta_frames=args.priority_beta_frames,
         )
 
-        # Initialize priority_buffer with offline data (priority = 1.0)
-        priority_buffer.load_from_buffer(offline_buffer, priority=1.0)
-        print(f"Initialized priority buffer with {priority_buffer.size} offline transitions")
-
-        # Default priority for initial collection only
-        default_priority = offline_buffer.size / args.collect_steps
-        print(f"Default priority for initial collection: {default_priority:.2f}")
+        # Initialize priority_offline_buffer with offline data (priority = 1.0)
+        priority_offline_buffer.load_from_buffer(offline_buffer, priority=1.0)
+        print(f"Initialized priority offline buffer with {priority_offline_buffer.size} transitions")
 
         # Density network
         density_net = DensityNetwork.create(
@@ -553,10 +584,10 @@ def main():
         # Add to online buffer (both modes)
         online_buffer.insert(obs, action, next_obs, reward, mask)
 
-        # A3RL: Also add to priority buffer with default_priority (only during initial collection)
+        # A3RL: Also add to priority_online_buffer with default_priority (only during initial collection)
         if args.algorithm == "a3rl":
-            priority_buffer.insert_with_priority(
-                obs, action, next_obs, reward, mask, default_priority
+            priority_online_buffer.insert_with_priority(
+                obs, action, next_obs, reward, mask, 1.0
             )
 
         obs = next_obs
@@ -565,16 +596,15 @@ def main():
 
     print(f"Collection complete. Online buffer size: {online_buffer.size}")
     if args.algorithm == "a3rl":
-        print(f"Priority buffer size: {priority_buffer.size}")
+        print(f"Priority offline buffer size: {priority_offline_buffer.size}")
+        print(f"Priority online buffer size: {priority_online_buffer.size}")
 
     # Training
     if args.algorithm == "rlpd":
         agent = train_rlpd(args, agent, offline_buffer, online_buffer, env, eval_env)
     else:
-        # Pass offline_size to track percentage of offline samples in priority buffer
-        offline_size = offline_buffer.size
         agent = train_a3rl(args, agent, density_net, offline_buffer, online_buffer,
-                          priority_buffer, offline_size, env, eval_env)
+                          priority_offline_buffer, priority_online_buffer, env, eval_env)
 
     print("Training complete!")
 

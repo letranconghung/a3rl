@@ -16,10 +16,10 @@ def create_dataset_name(dataset_spec):
         for part in dataset_spec.split(','):
             if ':' in part:
                 ds, pct = part.rsplit(':', 1)
-                parts.append(f"{ds.split('/')[-1]}p{int(float(pct)*100)}")
+                parts.append(f"{ds}p{int(float(pct)*100)}")
             else:
-                parts.append(f"{part.split('/')[-1]}p100")
-        return "mixed_" + "_".join(parts)
+                parts.append(f"{part}p100")
+        return "_".join(parts)
     else:
         # Single dataset
         return dataset_spec
@@ -35,8 +35,8 @@ def main():
                        help="Print commands without submitting")
     parser.add_argument("--num_chains", type=int, default=1,
                        help="Number of chained jobs (default: 3 for 8hr limit)")
-    parser.add_argument("--time_limit", type=str, default="07:45:00",
-                       help="Time limit per job in HH:MM:SS format (default: 07:45:00)")
+    parser.add_argument("--time_limit", type=str, default="07:55:00",
+                       help="Time limit per job in HH:MM:SS format (default: 07:55:00)")
     parser.add_argument("--version", type=str, default="v01",
                        help="Version prefix for WandB group name (default: v01)")
     parser.add_argument("--algorithm", type=str, nargs="+", default=["a3rl"],
@@ -88,9 +88,9 @@ def main():
 
         # Group name: version_dataset_params (no seed, no timestamp)
         wandb_group = f"{args.version}_{dataset_name.replace('/', '_')}_{param_str}"
-        run_id = f"{dataset_name.replace('/', '_')}_seed{seed}_{param_str}_{timestamp}"
+        run_id = f"{args.version}_{dataset_name.replace('/', '_')}_seed{seed}_{param_str}_{timestamp}"
 
-        job_base_name = f"{algo}_{dataset_name.replace('/', '_')}_s{seed}_{param_str}"
+        job_base_name = f"{algo}_{args.version}_{dataset_name.replace('/', '_')}_s{seed}_{param_str}"
 
         if args.dry_run:
             print(f"Training run: {run_id}")
@@ -167,12 +167,12 @@ cd /share/data/ripl/hung/a3rl_workspace/a3rl
                     print(f"✗ Failed {job_name}: {result.stderr.strip()}")
                     break  # Don't submit remaining chain if one fails
 
-        if args.dry_run:
-            print(f"Total training runs: {len(configs)}")
-            print(f"Jobs per run: {args.num_chains} (chained)")
-            print(f"Time limit per job: {args.time_limit}")
-            print(f"Total SLURM jobs: {len(configs) * args.num_chains}\n")
-            print()
+    if args.dry_run:
+        print(f"Total training runs: {len(configs)}")
+        print(f"Jobs per run: {args.num_chains} (chained)")
+        print(f"Time limit per job: {args.time_limit}")
+        print(f"Total SLURM jobs: {len(configs) * args.num_chains}\n")
+        print()
 
 
 if __name__ == "__main__":
