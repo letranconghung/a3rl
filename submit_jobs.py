@@ -2,6 +2,7 @@
 """Simple script to submit multiple SLURM jobs for a3rl training with automatic checkpointing."""
 
 import argparse
+import json
 import subprocess
 from itertools import product
 from datetime import datetime
@@ -33,18 +34,16 @@ def main():
                        help="Random seeds (default: 0, 1, 2)")
     parser.add_argument("--dry_run", action="store_true",
                        help="Print commands without submitting")
-    parser.add_argument("--num_chains", type=int, default=1,
-                       help="Number of chained jobs (default: 3 for 8hr limit)")
-    parser.add_argument("--time_limit", type=str, default="07:55:00",
-                       help="Time limit per job in HH:MM:SS format (default: 07:55:00)")
+    parser.add_argument("--max_concurrent", type=int, default=None,
+                       help="Maximum number of concurrent array tasks (throttle). None = no limit")
     parser.add_argument("--version", type=str, default="v01",
                        help="Version prefix for WandB group name (default: v01)")
     parser.add_argument("--algorithm", type=str, nargs="+", default=["a3rl"],
                        choices=["rlpd", "a3rl"],
                        help="Algorithm(s) to run (default: a3rl)")
-    parser.add_argument("--priority_alpha", type=float, nargs="+", default=[0.04],
-                       help="Priority alpha values (default: 0.6, only used for a3rl)")
-    parser.add_argument("--advantage_lambda", type=float, nargs="+", default=[0.3],
+    parser.add_argument("--priority_alpha", type=float, nargs="+", default=[0.2],
+                       help="Priority alpha values (default: 0.2, only used for a3rl)")
+    parser.add_argument("--advantage_lambda", type=float, nargs="+", default=[1],
                        help="Advantage lambda values (default: 1.0, only used for a3rl)")
     parser.add_argument("--advantage_beta", type=float, nargs="+", default=[-0.2],
                        help="Advantage beta (UCB coefficient) values (default: 1.0, only used for a3rl)")
@@ -55,6 +54,9 @@ def main():
     # For RLPD: only dataset and seed matter
     # For A3RL: dataset, seed, and priority params
     configs = []
+    if len(args.algorithm) > 1:
+        raise ValueError("More than 1 algorithm supplied!")
+    
     for algo in args.algorithm:
         if algo == "rlpd":
             # RLPD doesn't use priority params
@@ -67,112 +69,130 @@ def main():
             ):
                 configs.append((algo, dataset_id, seed, p_alpha, adv_lambda, adv_beta))
 
-    if args.dry_run:
-        print("DRY RUN - Commands that would be executed:\n")
-
     # Create logs directory
-
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     logs_dir = Path(f"logs/{timestamp}")
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build complete config data for all jobs
+    configs_data = []
     for algo, dataset_id, seed, p_alpha, adv_lambda, adv_beta in configs:
-        # Create readable dataset name for naming
         dataset_name = create_dataset_name(dataset_id)
 
-        # Create unique run_id for this training run
         if algo == "rlpd":
             param_str = "rlpd"
         else:
             param_str = f"a3rl_a{p_alpha}_l{adv_lambda}_b{adv_beta}"
 
-        # Group name: version_dataset_params (no seed, no timestamp)
         wandb_group = f"{args.version}_{dataset_name.replace('/', '_')}_{param_str}"
         run_id = f"{args.version}_{dataset_name.replace('/', '_')}_seed{seed}_{param_str}_{timestamp}"
 
-        job_base_name = f"{algo}_{args.version}_{dataset_name.replace('/', '_')}_s{seed}_{param_str}"
+        configs_data.append({
+            'algo': algo,
+            'dataset_id': dataset_id,
+            'seed': seed,
+            'p_alpha': p_alpha,
+            'adv_lambda': adv_lambda,
+            'adv_beta': adv_beta,
+            'run_id': run_id,
+            'wandb_group': wandb_group,
+            'wandb_version': args.version
+        })
 
-        if args.dry_run:
-            print(f"Training run: {run_id}")
-            print(f"  Algorithm: {algo}, Dataset: {dataset_id}, Seed: {seed}")
-            if algo == "a3rl":
-                print(f"  Params: alpha={p_alpha}, lambda={adv_lambda}, beta={adv_beta}")
-            print(f"  WandB group: {wandb_group}")
-            print(f"  Chained jobs: {args.num_chains}")
+    # Write config file
+    config_file = logs_dir / f"configs_{timestamp}.json"
+    with open(config_file, 'w') as f:
+        json.dump(configs_data, f, indent=2)
 
-        previous_job_id = None
+    # Build array job script
+    job_base_name = f"{args.version}||ds={','.join([d.split('/')[1]+'-'+d.split('/')[-1][:-3] for d in args.dataset_ids])}||a={','.join([f'{a:.2f}' for a in args.priority_alpha])}||l={','.join([f'{l:.2f}' for l in args.advantage_lambda])}||b={','.join([f'{b:.2f}' for b in args.advantage_beta])}"
+    throttle_str = f"%{args.max_concurrent}" if args.max_concurrent else ""
+    array_range = f"0-{len(configs_data) - 1}"
 
-        for chain_idx in range(args.num_chains):
-            job_name = f"{job_base_name}_p{chain_idx + 1}"
-
-            # Build the training command
-            train_cmd = (
-                f"python train.py "
-                f"--algorithm {algo} "
-                f"--dataset_id {dataset_id} "
-                f"--seed {seed} "
-                f"--run_id {run_id} "
-                f"--wandb_group {wandb_group} "
-                f"--wandb_version {args.version}"
-            )
-
-            # Add priority params only for a3rl
-            if algo == "a3rl":
-                train_cmd += (
-                    f" --priority_alpha {p_alpha} "
-                    f"--advantage_lambda {adv_lambda} "
-                    f"--advantage_beta {adv_beta}"
-                )
-
-            # Add resume flag for continuation jobs
-            if chain_idx > 0:
-                checkpoint_path = f"checkpoints/{run_id}/checkpoint_step_*.pt"
-                train_cmd += f" --resume_from $(ls -t {checkpoint_path} 2>/dev/null | head -1)"
-
-            # Build sbatch script using heredoc style
-            dependency_line = f"#SBATCH --dependency=afterany:{previous_job_id}" if previous_job_id else ""
-
-            sbatch_script = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --output={logs_dir}/{timestamp}_{job_name}_%j.out
+    sbatch_script = f"""#!/bin/bash
+#SBATCH --job-name={job_base_name}
+#SBATCH --output={logs_dir}/%A_%a.out
 #SBATCH --partition=gpu
 #SBATCH --gpus=1
-#SBATCH --time={args.time_limit}
-{dependency_line}
+#SBATCH --array={array_range}{throttle_str}
 
+# Read config for this array task
+CONFIG_FILE={config_file.absolute()}
+TASK_ID=$SLURM_ARRAY_TASK_ID
+
+# Initialize conda for bash (source conda.sh from miniconda3)
+source /share/data/ripl/hung/miniconda3/etc/profile.d/conda.sh
 conda activate a3rl_jax
 cd /share/data/ripl/hung/a3rl_workspace/a3rl
-{train_cmd}
+
+# Use Python to read config and execute training
+python -c "
+import json
+import subprocess
+import sys
+
+with open('$CONFIG_FILE') as f:
+    configs = json.load(f)
+
+config = configs[$TASK_ID]
+
+# Build training command
+cmd = [
+    'python', 'train.py',
+    '--algorithm', config['algo'],
+    '--dataset_id', config['dataset_id'],
+    '--seed', str(config['seed']),
+    '--run_id', config['run_id'],
+    '--wandb_group', config['wandb_group'],
+    '--wandb_version', config['wandb_version']
+]
+
+# Add a3rl-specific params
+if config['algo'] == 'a3rl' and config['p_alpha'] is not None:
+    cmd.extend([
+        '--priority_alpha', str(config['p_alpha']),
+        '--advantage_lambda', str(config['adv_lambda']),
+        '--advantage_beta', str(config['adv_beta'])
+    ])
+
+# Run training
+subprocess.run(cmd, check=True)
+"
 """
 
-            if args.dry_run:
-                dep_str = f" (depends on {previous_job_id})" if previous_job_id else ""
-                print(f"  Job {chain_idx + 1}/{args.num_chains}: {job_name}{dep_str}")
-                print(f"    {train_cmd}")
-            else:
-                # Submit script via stdin to sbatch
-                result = subprocess.run(
-                    ["sbatch"],
-                    input=sbatch_script,
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    # Extract job ID from sbatch output (format: "Submitted batch job 12345")
-                    job_id = result.stdout.strip().split()[-1]
-                    previous_job_id = job_id
-                    dep_str = f" (depends on previous)" if chain_idx > 0 else ""
-                    print(f"✓ Submitted {job_name}: Job ID {job_id}{dep_str}")
-                else:
-                    print(f"✗ Failed {job_name}: {result.stderr.strip()}")
-                    break  # Don't submit remaining chain if one fails
-
     if args.dry_run:
-        print(f"Total training runs: {len(configs)}")
-        print(f"Jobs per run: {args.num_chains} (chained)")
-        print(f"Time limit per job: {args.time_limit}")
-        print(f"Total SLURM jobs: {len(configs) * args.num_chains}\n")
-        print()
+        print("DRY RUN - Array job configuration:\n")
+        print(f"Config file: {config_file}")
+        print(f"Array job name: {job_base_name}")
+        print(f"Array range: {array_range}{throttle_str}")
+        print(f"Total tasks: {len(configs_data)}")
+        if args.max_concurrent:
+            print(f"Max concurrent: {args.max_concurrent}")
+        print(f"All configurations:")
+        for i, cfg in enumerate(configs_data):
+            print(f"\n  Task {i}:")
+            print(f"    Algorithm: {cfg['algo']}, Dataset: {cfg['dataset_id']}, Seed: {cfg['seed']}")
+            if cfg['algo'] == 'a3rl':
+                print(f"    Params: alpha={cfg['p_alpha']}, lambda={cfg['adv_lambda']}, beta={cfg['adv_beta']}")
+            print(f"    Run ID: {cfg['run_id']}")
+        print(f"\nLogs will be written to: {logs_dir}/<job_id>_<task_id>.out")
+    else:
+        # Submit array job
+        result = subprocess.run(
+            ["sbatch"],
+            input=sbatch_script,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            job_id = result.stdout.strip().split()[-1]
+            print(f"✓ Submitted array job: {job_base_name}")
+            print(f"  Job ID: {job_id}")
+            print(f"  Tasks: {len(configs_data)} (array {array_range}{throttle_str})")
+            print(f"  Config: {config_file}")
+            print(f"  Logs: {logs_dir}/<job_id>_<task_id>.out")
+        else:
+            print(f"✗ Failed to submit array job: {result.stderr.strip()}")
 
 
 if __name__ == "__main__":

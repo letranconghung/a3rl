@@ -1,0 +1,6 @@
+**/__pycache__
+.env
+wandb
+logs
+checkpoints
+rlpd

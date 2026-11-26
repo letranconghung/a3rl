@@ -5,9 +5,15 @@ RLPD stable version: v08->v13.
 A3RL stable version: v14
 
 # Changelogs
+## Version 16
+- Version 15 was actually buggy -- the initial offline priorities were not set to exp(lambda * advantage)
+- However, it did affect the online transitions
+## Version 15
+- offline default priority to be exp(lambda * 3)
+- online default priority to be exp(lambda * 3) as well.
+- SAC updates now have another offline and online batch passed through to calculate advantage
 ## Version 14
 - warmup steps was at 0.005 for version 13. changed to 0.25.
-- 
 ## Version 13
 - fixed bug from v12, where ther was a shape mismatch for offline priority, etc.
 ## Version 12
@@ -30,5 +36,3 @@ A3RL stable version: v14
 - Priority Buffer has both offline and online. Only the last minibatch has its priority updated (since actor is only run on this minibatch). An extra run of density network through this (mixed offline and online) minibatch is required (can't reuse density values from the training of the density network itself).
 - Advantage_LCB has hyperparameter $\beta = -0.2$, which corresponds to roughly 25%. Advantage LCB of the minibatch above is normalized to Z-score against the advantage LCB of an extra offline minibatch; so that $\lambda$ can be independent of environment.
 - Importance sampling weights are NOT normalized to have max = 1, but rather so that their sum = UTD_ratio, so that it's similar to the uniform case. Previous normalizations to have max = 1 yield mean_weight ~ dubious amounts (too much/too little)
-
-

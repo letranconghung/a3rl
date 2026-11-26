@@ -303,9 +303,10 @@ class SACLearner(struct.PyTreeNode):
         batch: Dict[str, jnp.ndarray],
         utd_ratio: int,
         weights: Optional[jnp.ndarray] = None,
-        offline_only_batch: Optional[Dict[str, jnp.ndarray]] = None
+        offline_only_batch: Optional[Dict[str, jnp.ndarray]] = None,
+        online_only_batch: Optional[Dict[str, jnp.ndarray]] = None
     ) -> Tuple["SACLearner", Dict[str, jnp.ndarray]]:
-        """Full update with UTD ratio. Returns Q-values from last minibatch for priority computation.
+        """Full update with UTD ratio. Returns Q-values from separate batches for priority computation.
 
         Args:
             batch: Main training batch
@@ -313,6 +314,8 @@ class SACLearner(struct.PyTreeNode):
             weights: Optional importance sampling weights for main batch
             offline_only_batch: Optional offline-only batch for computing normalization statistics
                                (no backpropagation on these samples)
+            online_only_batch: Optional online-only batch for computing normalization statistics
+                              (no backpropagation on these samples)
         """
         new_agent = self
         batch_size = jax.tree_util.tree_leaves(batch)[0].shape[0] // utd_ratio
@@ -334,9 +337,10 @@ class SACLearner(struct.PyTreeNode):
 
         info = {**critic_info, **actor_info, **temp_info}
 
+        rng = new_agent.rng
         # If offline_only_batch is provided, compute Q-values for normalization
         if offline_only_batch is not None:
-            rng, key = jax.random.split(new_agent.rng)
+            rng, key = jax.random.split(rng)
 
             # Compute Q-values for offline batch actions (no gradient)
             offline_qs = new_agent.critic.apply_fn(
@@ -361,8 +365,34 @@ class SACLearner(struct.PyTreeNode):
             info["offline_qs"] = offline_qs
             info["offline_qs_policy"] = offline_qs_policy
 
-            new_agent = new_agent.replace(rng=rng)
+        # If online_only_batch is provided, compute Q-values for normalization
+        if online_only_batch is not None:
+            rng, key = jax.random.split(rng)
 
+            # Compute Q-values for online batch actions (no gradient)
+            online_qs = new_agent.critic.apply_fn(
+                {"params": new_agent.critic.params},
+                online_only_batch["observations"],
+                online_only_batch["actions"]
+            )
+
+            # Compute Q-values for policy actions on online batch (no gradient)
+            online_dist = new_agent.actor.apply_fn(
+                {"params": new_agent.actor.params},
+                online_only_batch["observations"]
+            )
+            online_policy_actions = online_dist.sample(seed=key)
+            online_qs_policy = new_agent.critic.apply_fn(
+                {"params": new_agent.critic.params},
+                online_only_batch["observations"],
+                online_policy_actions
+            )
+
+            # Store Q-values in info for computing advantage with same beta
+            info["online_qs"] = online_qs
+            info["online_qs_policy"] = online_qs_policy
+
+        new_agent = new_agent.replace(rng=rng)
         return new_agent, info
 
     @jax.jit
